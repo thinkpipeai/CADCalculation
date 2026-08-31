@@ -1,55 +1,208 @@
 import ezdxf
+from shapely.geometry import Polygon, Point, LineString
 
-def generate_westwood_plan():
-    # 创建 DXF 文档，设置单位为英寸 (1 = Inches)
-    doc = ezdxf.new('R2010')
-    doc.header['$INSUNITS'] = 1
-    msp = doc.modelspace()
+FLOOR_LAYERS = ("A-FLOOR", "A-FLOOR-SHOWER", "A-FLOOR-BATH-DRY")
 
-    # 1. 创建符合算量逻辑的规范图层
-    doc.layers.add("A-FLOOR-GARAGE", color=1)      # 车库地面 (红色)
-    doc.layers.add("A-FLOOR-LIVING", color=3)      # 居住区地面 (绿色)
-    doc.layers.add("A-FLOOR-UNFINISHED", color=5)  # 未完工/地下室地面 (蓝色)
-    doc.layers.add("A-ROOM-NAME", color=2)         # 房间标注文字 (黄色)
-    doc.layers.add("E-EQUIPMENT", color=6)         # 设备/热水器等图块 (粉色)
+def _polyline_to_polygon(poly):
+    points = [(p[0], p[1]) for p in poly.get_points()]
+    return Polygon(points)
 
-    # 2. 转换图纸主要区域坐标 (尺寸依据图纸标注: 24'-0"=288", 18'-0"=216", 17'-11"=215" 等)
-    
-    # 区域 A: 2-Car Garage (24'-0" x 18'-0")
-    garage_polygon = [(0, 0), (288, 0), (288, 216), (0, 216)]
-    msp.add_lwpolyline(garage_polygon, dxfattribs={'layer': 'A-FLOOR-GARAGE', 'closed': True})
 
-    # 区域 B: Main Living / Kitchen / Dining (上方大跨度区域 approx 40'-0" x 17'-11")
-    living_polygon = [(0, 216), (480, 216), (480, 431), (0, 431)]
-    msp.add_lwpolyline(living_polygon, dxfattribs={'layer': 'A-FLOOR-LIVING', 'closed': True})
+def _mm2m(value_mm):
+    return value_mm / 1000
 
-    # 区域 C: Entertainment Room / Basement Space (右下区域)
-    ent_polygon = [(288, 0), (480, 0), (480, 216), (288, 216)]
-    msp.add_lwpolyline(ent_polygon, dxfattribs={'layer': 'A-FLOOR-LIVING', 'closed': True})
 
-    # 3. 写入房间标识文字 (确保放置在各封闭多边形内部，便于 Shapely 归属计算)
-    room_annotations = [
-        ("2-CAR GARAGE", (100, 100), "A-ROOM-NAME"),
-        ("LIVING / DINING AREA", (80, 320), "A-ROOM-NAME"),
-        ("KITCHEN", (350, 320), "A-ROOM-NAME"),
-        ("BATH", (430, 250), "A-ROOM-NAME"),
-        ("ENTERTAINMENT ROOM", (340, 100), "A-ROOM-NAME"),
-        ("BASEMENT", (50, 250), "A-ROOM-NAME"),
+def _mm2m2(area_mm2):
+    return area_mm2 / 1_000_000
+
+
+def _rect_from_polygon(polygon):
+    minx, miny, maxx, maxy = polygon.bounds
+    return maxx - minx, maxy - miny
+
+
+def _resolve_room_name(polygon, texts):
+    centroid = polygon.centroid
+    nearest = None
+    for text in texts:
+        label = text.dxf.text.strip()
+        if "户型平面图" in label or label in ("吊柜", "地柜"):
+            continue
+        pos = Point(text.dxf.insert.x, text.dxf.insert.y)
+        if polygon.contains(pos):
+            return label
+        dist = pos.distance(centroid)
+        if nearest is None or dist < nearest[0]:
+            nearest = (dist, label)
+    if nearest and nearest[0] < 2000:
+        return nearest[1]
+    return "未命名区域"
+
+
+def _extract_rooms(msp):
+    texts = list(msp.query('TEXT[layer=="A-ROOM-NAME"]'))
+    rooms = []
+    for layer in FLOOR_LAYERS:
+        for poly in msp.query(f'LWPOLYLINE[layer=="{layer}"]'):
+            if not poly.closed:
+                continue
+            polygon = _polyline_to_polygon(poly)
+            rooms.append({
+                "name": _resolve_room_name(polygon, texts),
+                "layer": layer,
+                "polygon": polygon,
+                "doors": [],
+                "windows": [],
+                "cabinets": [],
+                "socket_count": 0,
+            })
+    return rooms
+
+
+def _extract_doors(msp):
+    """提取门：弧线门（半径=门宽）+ 推拉门（双线间距）"""
+    doors = []
+
+    for arc in msp.query('ARC[layer=="A-DOOR"]'):
+        cx, cy = arc.dxf.center.x, arc.dxf.center.y
+        doors.append({
+            "type": "平开门",
+            "width_mm": arc.dxf.radius,
+            "position": (cx, cy),
+        })
+
+    lines = [
+        LineString([(ln.dxf.start.x, ln.dxf.start.y), (ln.dxf.end.x, ln.dxf.end.y)])
+        for ln in msp.query('LINE[layer=="A-DOOR"]')
     ]
+    used = set()
+    for i, line_a in enumerate(lines):
+        if i in used:
+            continue
+        for j, line_b in enumerate(lines[i + 1:], start=i + 1):
+            if j in used:
+                continue
+            if line_a.distance(line_b) > 100:
+                continue
+            length_a, length_b = line_a.length, line_b.length
+            if abs(length_a - length_b) > 50:
+                continue
+            mid = line_a.interpolate(0.5, normalized=True)
+            doors.append({
+                "type": "推拉门",
+                "width_mm": max(length_a, length_b),
+                "position": (mid.x, mid.y),
+            })
+            used.update({i, j})
+            break
 
-    for name, pos, layer in room_annotations:
-        text = msp.add_text(name, dxfattribs={'layer': layer, 'height': 10})
-        text.set_placement(pos)
+    return doors
 
-    # 4. 模拟图纸中的关键设备 (如 Water Heater / HVAC)
-    heater_block = doc.blocks.new(name="WATER_HEATER")
-    heater_block.add_circle((0, 0), radius=12) # 24英寸直径热水器
-    
-    # 在 Heater Closet 位置放置设备
-    msp.add_blockref("WATER_HEATER", (270, 230), dxfattribs={'layer': 'E-EQUIPMENT'})
 
-    doc.saveas("westwood_proposed_plan.dxf")
-    print("✅ 已成功按图纸结构生成 DXF: westwood_proposed_plan.dxf")
+def _extract_windows(msp):
+    """提取窗洞：聚类 A-WINDOW 线段，取最长边为洞口宽度"""
+    window_lines = []
+    for ln in msp.query('LINE[layer=="A-WINDOW"]'):
+        line = LineString([
+            (ln.dxf.start.x, ln.dxf.start.y),
+            (ln.dxf.end.x, ln.dxf.end.y),
+        ])
+        if line.length >= 800:
+            window_lines.append(line)
 
-if __name__ == "__main__":
-    generate_westwood_plan()
+    windows = []
+    used = set()
+    for i, line_a in enumerate(window_lines):
+        if i in used:
+            continue
+        group = [line_a]
+        mid_a = line_a.interpolate(0.5, normalized=True)
+        for j, line_b in enumerate(window_lines):
+            if j == i or j in used:
+                continue
+            mid_b = line_b.interpolate(0.5, normalized=True)
+            if mid_a.distance(Point(mid_b.x, mid_b.y)) > 200:
+                continue
+            group.append(line_b)
+            used.add(j)
+        used.add(i)
+        width_mm = max(seg.length for seg in group)
+        mid = line_a.interpolate(0.5, normalized=True)
+        windows.append({
+            "width_mm": width_mm,
+            "position": (mid.x, mid.y),
+        })
+
+    return windows
+
+
+def _extract_cabinets(msp):
+    """提取橱柜矩形：闭合多段线的宽、深、面积"""
+    cabinets = []
+    for layer, cab_type in (("A-CABINET-BASE", "地柜"), ("A-CABINET-WALL", "吊柜")):
+        for poly in msp.query(f'LWPOLYLINE[layer=="{layer}"]'):
+            if not poly.closed:
+                continue
+            polygon = _polyline_to_polygon(poly)
+            width_mm, depth_mm = _rect_from_polygon(polygon)
+            cabinets.append({
+                "type": cab_type,
+                "width_mm": width_mm,
+                "depth_mm": depth_mm,
+                "area_m2": _mm2m2(polygon.area),
+                "position": (polygon.centroid.x, polygon.centroid.y),
+            })
+    return cabinets
+
+
+def _assign_entities(rooms, entities, attr):
+    for entity in entities:
+        pt = Point(entity["position"])
+        for room in rooms:
+            if room["polygon"].contains(pt):
+                room[attr].append(entity)
+                break
+        else:
+            candidates = [
+                r for r in rooms
+                if r["polygon"].boundary.distance(pt) < 500
+            ]
+            if candidates:
+                max(candidates, key=lambda r: r["polygon"].area)[attr].append(entity)
+
+
+def _print_room_report(room):
+    polygon = room["polygon"]
+    area_m2 = _mm2m2(polygon.area)
+    perimeter_m = _mm2m(polygon.length)
+    width_mm, depth_mm = _rect_from_polygon(polygon)
+
+    print(f"====== {room['name']} ======")
+    print(f"图层:\t\t{room['layer']}")
+    print(f"净面积:\t\t{area_m2:.2f} m²")
+    print(f"周长:\t\t{perimeter_m:.2f} m")
+    print(f"包络尺寸:\t{_mm2m(width_mm):.2f} m × {_mm2m(depth_mm):.2f} m (宽×深)")
+
+    if room["doors"]:
+        print(f"门 ({len(room['doors'])} 樘):")
+        for i, door in enumerate(room["doors"], 1):
+            print(f"  [{i}] {door['type']}  宽度 {_mm2m(door['width_mm']):.2f} m")
+
+    if room["windows"]:
+        print(f"窗 ({len(room['windows'])} 扇):")
+        for i, win in enumerate(room["windows"], 1):
+            print(f"  [{i}] 洞口宽度 {_mm2m(win['width_mm']):.2f} m")
+
+    if room["cabinets"]:
+        print(f"橱柜 ({len(room['cabinets'])} 组):")
+        for i, cab in enumerate(room["cabinets"], 1):
+            print(
+                f"  [{i}] {cab['type']}  "
+                f"{_mm2m(cab['width_mm']):.2f} m × {_mm2m(cab['depth_mm']):.2f} m  "
+                f"面积 {cab['area_m2']:.2f} m²"
+            )
+
+    if room["socket_count"]:
+        print(f"插座:\t\t{room['socket_count']} 个")
+
+    print()
