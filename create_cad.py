@@ -1,252 +1,265 @@
 import ezdxf
-from shapely.geometry import Polygon, Point, LineString
+import math
 
-FLOOR_LAYERS = ("A-FLOOR", "A-FLOOR-SHOWER", "A-FLOOR-BATH-DRY")
+# 图纸单位：毫米 (mm)，与 calculate.py 算量逻辑一致
 
-def _polyline_to_polygon(poly):
-    points = [(p[0], p[1]) for p in poly.get_points()]
-    return Polygon(points)
-
-
-def _mm2m(value_mm):
-    return value_mm / 1000
+WALL_THICK = 200       # 墙体厚度
+DOOR_WIDTH = 900       # 门洞宽度
+WINDOW_WIDTH = 1500    # 窗洞宽度
+WINDOW_SILL = 900      # 窗台高度（示意用）
 
 
-def _mm2m2(area_mm2):
-    return area_mm2 / 1_000_000
+def _add_layers(doc):
+    """创建规范图层"""
+    layers = {
+        "A-WALL": 7,              # 墙体
+        "A-FLOOR": 3,             # 房间地面（算量用）
+        "A-FLOOR-SHOWER": 4,    # 淋浴区地面
+        "A-FLOOR-BATH-DRY": 5,   # 卫生间干区地面
+        "A-ROOM-NAME": 2,        # 房间标注
+        "A-DOOR": 1,             # 门
+        "A-WINDOW": 6,           # 窗
+        "A-CABINET-WALL": 30,    # 吊柜
+        "A-CABINET-BASE": 40,    # 地柜
+        "E-SOCKET": 8,           # 插座
+    }
+    for name, color in layers.items():
+        doc.layers.add(name, color=color)
 
 
-def _rect_from_polygon(polygon):
-    minx, miny, maxx, maxy = polygon.bounds
-    return maxx - minx, maxy - miny
+def _rect(msp, x0, y0, x1, y1, layer, closed=True):
+    """绘制矩形多段线"""
+    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    return msp.add_lwpolyline(pts, dxfattribs={"layer": layer, "closed": closed})
 
 
-def _resolve_room_name(polygon, texts):
-    centroid = polygon.centroid
-    nearest = None
-    for text in texts:
-        label = text.dxf.text.strip()
-        if "户型平面图" in label or label in ("吊柜", "地柜"):
-            continue
-        pos = Point(text.dxf.insert.x, text.dxf.insert.y)
-        if polygon.contains(pos):
-            return label
-        dist = pos.distance(centroid)
-        if nearest is None or dist < nearest[0]:
-            nearest = (dist, label)
-    if nearest and nearest[0] < 2000:
-        return nearest[1]
-    return "未命名区域"
+def _wall(msp, x0, y0, x1, y1):
+    """绘制墙体线段"""
+    msp.add_line((x0, y0), (x1, y1), dxfattribs={"layer": "A-WALL"})
 
 
-def _extract_rooms(msp):
-    texts = list(msp.query('TEXT[layer=="A-ROOM-NAME"]'))
-    rooms = []
-    for layer in FLOOR_LAYERS:
-        for poly in msp.query(f'LWPOLYLINE[layer=="{layer}"]'):
-            if not poly.closed:
-                continue
-            polygon = _polyline_to_polygon(poly)
-            rooms.append({
-                "name": _resolve_room_name(polygon, texts),
-                "layer": layer,
-                "polygon": polygon,
-                "doors": [],
-                "windows": [],
-                "cabinets": [],
-                "socket_count": 0,
-            })
-    return rooms
+def _wall_rect(msp, x0, y0, x1, y1):
+    """绘制矩形外墙（双线效果：外轮廓 + 内轮廓）"""
+    t = WALL_THICK
+    # 外轮廓
+    _rect(msp, x0, y0, x1, y1, "A-WALL")
+    # 内轮廓
+    _rect(msp, x0 + t, y0 + t, x1 - t, y1 - t, "A-WALL")
 
 
-def _extract_doors(msp):
-    """提取门：弧线门（半径=门宽）+ 推拉门（双线间距）"""
-    doors = []
-
-    for arc in msp.query('ARC[layer=="A-DOOR"]'):
-        cx, cy = arc.dxf.center.x, arc.dxf.center.y
-        doors.append({
-            "type": "平开门",
-            "width_mm": arc.dxf.radius,
-            "position": (cx, cy),
-        })
-
-    lines = [
-        LineString([(ln.dxf.start.x, ln.dxf.start.y), (ln.dxf.end.x, ln.dxf.end.y)])
-        for ln in msp.query('LINE[layer=="A-DOOR"]')
-    ]
-    used = set()
-    for i, line_a in enumerate(lines):
-        if i in used:
-            continue
-        for j, line_b in enumerate(lines[i + 1:], start=i + 1):
-            if j in used:
-                continue
-            if line_a.distance(line_b) > 100:
-                continue
-            length_a, length_b = line_a.length, line_b.length
-            if abs(length_a - length_b) > 50:
-                continue
-            mid = line_a.interpolate(0.5, normalized=True)
-            doors.append({
-                "type": "推拉门",
-                "width_mm": max(length_a, length_b),
-                "position": (mid.x, mid.y),
-            })
-            used.update({i, j})
-            break
-
-    return doors
+def _door(msp, x, y, width, angle=0):
+    """
+    绘制门（门洞弧线示意）
+    angle: 0=门轴在左向右开, 90=门轴在下向上开, 180=门轴在右向左开, 270=门轴在上向下开
+    """
+    msp.add_arc(
+        center=(x, y),
+        radius=width,
+        start_angle=angle,
+        end_angle=angle + 90,
+        dxfattribs={"layer": "A-DOOR"},
+    )
+    # 门扇示意线
+    rad = math.radians(angle)
+    msp.add_line(
+        (x, y),
+        (x + width * math.cos(rad), y + width * math.sin(rad)),
+        dxfattribs={"layer": "A-DOOR"},
+    )
 
 
-def _extract_windows(msp):
-    """提取窗洞：聚类 A-WINDOW 线段，取最长边为洞口宽度"""
-    window_lines = []
-    for ln in msp.query('LINE[layer=="A-WINDOW"]'):
-        line = LineString([
-            (ln.dxf.start.x, ln.dxf.start.y),
-            (ln.dxf.end.x, ln.dxf.end.y),
-        ])
-        if line.length >= 800:
-            window_lines.append(line)
-
-    windows = []
-    used = set()
-    for i, line_a in enumerate(window_lines):
-        if i in used:
-            continue
-        group = [line_a]
-        mid_a = line_a.interpolate(0.5, normalized=True)
-        for j, line_b in enumerate(window_lines):
-            if j == i or j in used:
-                continue
-            mid_b = line_b.interpolate(0.5, normalized=True)
-            if mid_a.distance(Point(mid_b.x, mid_b.y)) > 200:
-                continue
-            group.append(line_b)
-            used.add(j)
-        used.add(i)
-        width_mm = max(seg.length for seg in group)
-        mid = line_a.interpolate(0.5, normalized=True)
-        windows.append({
-            "width_mm": width_mm,
-            "position": (mid.x, mid.y),
-        })
-
-    return windows
-
-
-def _extract_cabinets(msp):
-    """提取橱柜矩形：闭合多段线的宽、深、面积"""
-    cabinets = []
-    for layer, cab_type in (("A-CABINET-BASE", "地柜"), ("A-CABINET-WALL", "吊柜")):
-        for poly in msp.query(f'LWPOLYLINE[layer=="{layer}"]'):
-            if not poly.closed:
-                continue
-            polygon = _polyline_to_polygon(poly)
-            width_mm, depth_mm = _rect_from_polygon(polygon)
-            cabinets.append({
-                "type": cab_type,
-                "width_mm": width_mm,
-                "depth_mm": depth_mm,
-                "area_m2": _mm2m2(polygon.area),
-                "position": (polygon.centroid.x, polygon.centroid.y),
-            })
-    return cabinets
-
-
-def _assign_entities(rooms, entities, attr):
-    for entity in entities:
-        pt = Point(entity["position"])
-        for room in rooms:
-            if room["polygon"].contains(pt):
-                room[attr].append(entity)
-                break
-        else:
-            candidates = [
-                r for r in rooms
-                if r["polygon"].boundary.distance(pt) < 500
-            ]
-            if candidates:
-                max(candidates, key=lambda r: r["polygon"].area)[attr].append(entity)
-
-
-def _print_room_report(room):
-    polygon = room["polygon"]
-    area_m2 = _mm2m2(polygon.area)
-    perimeter_m = _mm2m(polygon.length)
-    width_mm, depth_mm = _rect_from_polygon(polygon)
-
-    print(f"====== {room['name']} ======")
-    print(f"图层:\t\t{room['layer']}")
-    print(f"净面积:\t\t{area_m2:.2f} m²")
-    print(f"周长:\t\t{perimeter_m:.2f} m")
-    print(f"包络尺寸:\t{_mm2m(width_mm):.2f} m × {_mm2m(depth_mm):.2f} m (宽×深)")
-
-    if room["doors"]:
-        print(f"门 ({len(room['doors'])} 樘):")
-        for i, door in enumerate(room["doors"], 1):
-            print(f"  [{i}] {door['type']}  宽度 {_mm2m(door['width_mm']):.2f} m")
-
-    if room["windows"]:
-        print(f"窗 ({len(room['windows'])} 扇):")
-        for i, win in enumerate(room["windows"], 1):
-            print(f"  [{i}] 洞口宽度 {_mm2m(win['width_mm']):.2f} m")
-
-    if room["cabinets"]:
-        print(f"橱柜 ({len(room['cabinets'])} 组):")
-        for i, cab in enumerate(room["cabinets"], 1):
-            print(
-                f"  [{i}] {cab['type']}  "
-                f"{_mm2m(cab['width_mm']):.2f} m × {_mm2m(cab['depth_mm']):.2f} m  "
-                f"面积 {cab['area_m2']:.2f} m²"
-            )
-
-    if room["socket_count"]:
-        print(f"插座:\t\t{room['socket_count']} 个")
-
-    print()
-
-
-def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
-    try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-    except IOError:
-        print("❌ 找不到 CAD 文件，请先运行 create_cad.py 生成图纸！")
+def _window(msp, x0, y0, x1, y1):
+    """绘制窗户（双线 + 中线）"""
+    msp.add_line((x0, y0), (x1, y1), dxfattribs={"layer": "A-WINDOW"})
+    # 窗框平行线
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length == 0:
         return
+    nx, ny = -dy / length * 80, dx / length * 80
+    msp.add_line((x0 + nx, y0 + ny), (x1 + nx, y1 + ny), dxfattribs={"layer": "A-WINDOW"})
+    msp.add_line((x0 - nx, y0 - ny), (x1 - nx, y1 - ny), dxfattribs={"layer": "A-WINDOW"})
+    # 玻璃中线
+    mx0, my0 = (x0 + x1) / 2, (y0 + y1) / 2
+    msp.add_line((mx0 + nx, my0 + ny), (mx0 - nx, my0 - ny), dxfattribs={"layer": "A-WINDOW"})
 
-    rooms = _extract_rooms(msp)
-    doors = _extract_doors(msp)
-    windows = _extract_windows(msp)
-    cabinets = _extract_cabinets(msp)
-    sockets = list(msp.query('INSERT[layer=="E-SOCKET"]'))
 
-    _assign_entities(rooms, doors, "doors")
-    _assign_entities(rooms, windows, "windows")
-    _assign_entities(rooms, cabinets, "cabinets")
+def _cabinet_base(msp, x0, y0, x1, y1):
+    """地柜：贴地矩形 + 台面线"""
+    _rect(msp, x0, y0, x1, y1, "A-CABINET-BASE")
+    # 台面示意
+    msp.add_line((x0, y1), (x1, y1), dxfattribs={"layer": "A-CABINET-BASE"})
 
-    for room in rooms:
-        room["socket_count"] = sum(
-            1 for s in sockets
-            if room["polygon"].contains(Point(s.dxf.insert.x, s.dxf.insert.y))
-        )
 
-    print(f"📐 图纸解析完成: {dxf_path}")
-    print(f"   共识别 {len(rooms)} 个房间区域\n")
+def _cabinet_wall(msp, x0, y0, x1, y1):
+    """吊柜：贴墙矩形（虚线边框示意）"""
+    _rect(msp, x0, y0, x1, y1, "A-CABINET-WALL")
+    # 柜门分隔线
+    mid_x = (x0 + x1) / 2
+    msp.add_line((mid_x, y0), (mid_x, y1), dxfattribs={"layer": "A-CABINET-WALL"})
 
-    total_area = 0.0
-    for room in sorted(rooms, key=lambda r: r["name"]):
-        _print_room_report(room)
-        total_area += _mm2m2(room["polygon"].area)
 
-    print("====== 汇总 ======")
-    print(f"房间总数:\t{len(rooms)}")
-    print(f"地面总面积:\t{total_area:.2f} m²")
-    print(f"门总数:\t\t{len(doors)} 樘")
-    print(f"窗总数:\t\t{len(windows)} 扇")
-    print(f"橱柜组数:\t{len(cabinets)} 组")
+def _room_label(msp, text, x, y, height=250):
+    t = msp.add_text(text, dxfattribs={"layer": "A-ROOM-NAME", "height": height})
+    t.set_placement((x, y))
+
+
+def _socket_block(doc, msp, x, y):
+    if "SOCKET_86" not in doc.blocks:
+        blk = doc.blocks.new("SOCKET_86")
+        blk.add_circle((0, 0), radius=40)
+        blk.add_line((-25, 0), (25, 0))
+        blk.add_line((0, -25), (0, 25))
+    msp.add_blockref("SOCKET_86", (x, y), dxfattribs={"layer": "E-SOCKET"})
+
+
+def generate_2b1b_plan():
+    """
+    生成横平竖直的 2室1厅1卫 (2B1B) 户型平面图
+
+    户型尺寸：9000mm × 7000mm（约 9m × 7m，建筑面积约 63m²）
+    布局：
+      上层 - 客厅 + 厨房（含吊柜、地柜）
+      下层 - 主卧 + 卫生间（淋浴区/干区）+ 次卧
+    """
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 4  # 4 = Millimeters
+    msp = doc.modelspace()
+    _add_layers(doc)
+
+    t = WALL_THICK
+    W, H = 9000, 7000          # 外轮廓
+    MID_Y = 3500                 # 上下分区
+    SPLIT_X_LIVING = 5500        # 客厅/厨房分界
+    SPLIT_X_LOWER = 3500         # 主卧/卫生间分界
+    SPLIT_X_BATH = 5000          # 卫生间/次卧分界
+
+    # ── 1. 外墙 ──────────────────────────────────────────────
+    _wall_rect(msp, 0, 0, W, H)
+
+    # ── 2. 内墙（横平竖直） ──────────────────────────────────
+    # 水平隔墙：上下分区
+    _wall(msp, t, MID_Y, W - t, MID_Y)
+    # 上层垂直隔墙：客厅 | 厨房
+    _wall(msp, SPLIT_X_LIVING, MID_Y, SPLIT_X_LIVING, H - t)
+    # 下层垂直隔墙：主卧 | 卫生间 | 次卧
+    _wall(msp, SPLIT_X_LOWER, t, SPLIT_X_LOWER, MID_Y - t)
+    _wall(msp, SPLIT_X_BATH, t, SPLIT_X_BATH, MID_Y - t)
+    # 卫生间内部隔墙：淋浴区 | 干区
+    SHOWER_W = 1200
+    _wall(msp, SPLIT_X_LOWER + SHOWER_W, t, SPLIT_X_LOWER + SHOWER_W, MID_Y - t)
+
+    # ── 3. 房间地面多边形（算量归属用） ─────────────────────
+    # 客厅
+    _rect(msp, t, MID_Y + t, SPLIT_X_LIVING - t, H - t, "A-FLOOR")
+    # 厨房
+    _rect(msp, SPLIT_X_LIVING + t, MID_Y + t, W - t, H - t, "A-FLOOR")
+    # 主卧
+    _rect(msp, t, t, SPLIT_X_LOWER - t, MID_Y - t, "A-FLOOR")
+    # 次卧
+    _rect(msp, SPLIT_X_BATH + t, t, W - t, MID_Y - t, "A-FLOOR")
+    # 卫生间 - 淋浴区
+    _rect(msp, SPLIT_X_LOWER + t, t, SPLIT_X_LOWER + SHOWER_W - t, MID_Y - t, "A-FLOOR-SHOWER")
+    # 卫生间 - 干区（马桶、洗手台）
+    _rect(msp, SPLIT_X_LOWER + SHOWER_W + t, t, SPLIT_X_BATH - t, MID_Y - t, "A-FLOOR-BATH-DRY")
+
+    # ── 4. 厨房橱柜 ──────────────────────────────────────────
+    KX0 = SPLIT_X_LIVING + t + 100   # 厨房内缩
+    KX1 = W - t - 100
+    KY0 = MID_Y + t + 100
+    KY1 = H - t - 100
+    CAB_H_BASE = 600    # 地柜深度
+    CAB_H_WALL = 350    # 吊柜深度
+    CAB_H = 700         # 吊柜高度（示意）
+
+    # 地柜：沿厨房南墙（靠客厅侧）+ 西墙
+    _cabinet_base(msp, KX0, KY0, KX1, KY0 + CAB_H_BASE)
+    _cabinet_base(msp, KX0, KY0, KX0 + CAB_H_BASE, KY1 - CAB_H_WALL - 200)
+
+    # 吊柜：沿厨房北墙 + 东墙
+    _cabinet_wall(msp, KX0, KY1 - CAB_H_WALL, KX1, KY1)
+    _cabinet_wall(msp, KX1 - CAB_H_BASE, KY0 + CAB_H_BASE + 200, KX1, KY1 - CAB_H_WALL)
+
+    # ── 5. 卫生间设备示意 ────────────────────────────────────
+    # 淋浴房挡水条/玻璃隔断
+    sx0 = SPLIT_X_LOWER + t + 50
+    sx1 = SPLIT_X_LOWER + SHOWER_W - t - 50
+    sy0 = t + 50
+    sy1 = MID_Y - t - 50
+    _rect(msp, sx0, sy0, sx1, sy1, "A-WALL")          # 淋浴房外框
+    # 淋浴喷头示意
+    msp.add_circle((sx0 + 200, sy1 - 200), radius=80, dxfattribs={"layer": "A-WALL"})
+    # 干区：马桶
+    toilet_x = SPLIT_X_LOWER + SHOWER_W + 400
+    msp.add_circle((toilet_x, t + 600), radius=200, dxfattribs={"layer": "A-WALL"})
+    # 干区：洗手台
+    vanity_x0 = SPLIT_X_LOWER + SHOWER_W + 200
+    vanity_x1 = SPLIT_X_BATH - 200
+    _rect(msp, vanity_x0, MID_Y - t - 500, vanity_x1, MID_Y - t - 100, "A-WALL")
+
+    # ── 6. 门窗 ──────────────────────────────────────────────
+    DW = DOOR_WIDTH
+
+    # 入户门（南墙，客厅区域）
+    entry_x = 2500
+    _door(msp, entry_x, t, DW, angle=90)
+
+    # 客厅 → 主卧 门
+    _door(msp, 1800, MID_Y, DW, angle=0)
+
+    # 客厅 → 厨房 门（推拉门示意，用双线）
+    kit_door_x = SPLIT_X_LIVING
+    msp.add_line((kit_door_x, MID_Y + 800), (kit_door_x, MID_Y + 800 + DW), dxfattribs={"layer": "A-DOOR"})
+    msp.add_line((kit_door_x + 50, MID_Y + 800), (kit_door_x + 50, MID_Y + 800 + DW), dxfattribs={"layer": "A-DOOR"})
+
+    # 主卧 → 卫生间 门
+    _door(msp, SPLIT_X_LOWER, 2200, DW, angle=90)
+
+    # 次卧门
+    _door(msp, SPLIT_X_BATH, 2200, DW, angle=90)
+
+    # 外窗
+    WW = WINDOW_WIDTH
+    # 客厅南窗
+    _window(msp, 800, t, 800 + WW, t)
+    # 客厅西窗
+    _window(msp, t, 4500, t, 4500 + WW)
+    # 主卧西窗
+    _window(msp, t, 1200, t, 1200 + WW)
+    # 次卧东窗
+    _window(msp, W - t, 1200, W - t, 1200 + WW)
+    # 厨房北窗
+    _window(msp, 6500, H - t, 6500 + WW, H - t)
+
+    # ── 7. 房间标注 ──────────────────────────────────────────
+    _room_label(msp, "客厅", 2200, 5200)
+    _room_label(msp, "厨房", 6800, 5200)
+    _room_label(msp, "主卧", 1500, 1800)
+    _room_label(msp, "次卧", 6800, 1800)
+    _room_label(msp, "淋浴区", SPLIT_X_LOWER + 300, 1200, height=180)
+    _room_label(msp, "卫生间干区", SPLIT_X_LOWER + SHOWER_W + 350, 1800, height=180)
+    _room_label(msp, "吊柜", KX0 + 400, KY1 - 200, height=150)
+    _room_label(msp, "地柜", KX0 + 400, KY0 + 200, height=150)
+
+    # ── 8. 插座（测试算量图块统计） ──────────────────────────
+    _socket_block(doc, msp, 2000, 5000)   # 客厅
+    _socket_block(doc, msp, 7000, 5000)   # 厨房
+    _socket_block(doc, msp, 1500, 1500)   # 主卧
+    _socket_block(doc, msp, 7000, 1500)   # 次卧
+    _socket_block(doc, msp, SPLIT_X_LOWER + 800, 1500)  # 卫生间
+
+    # ── 9. 尺寸标注文字（户型说明） ──────────────────────────
+    title = msp.add_text(
+        "2B1B 户型平面图  9000×7000mm",
+        dxfattribs={"layer": "A-ROOM-NAME", "height": 300},
+    )
+    title.set_placement((W / 2 - 2000, H + 500))
+
+    outfile = "test_floor_plan.dxf"
+    doc.saveas(outfile)
+    print(f"✅ 已生成 2B1B 户型测试图: {outfile}")
+    print("   包含：客厅、厨房(吊柜+地柜)、主卧、次卧、卫生间(淋浴区+干区)、门窗")
 
 
 if __name__ == "__main__":
-    parse_and_calculate()
+    generate_2b1b_plan()
