@@ -206,3 +206,47 @@ def _print_room_report(room):
         print(f"插座:\t\t{room['socket_count']} 个")
 
     print()
+
+
+def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+    except IOError:
+        print("❌ 找不到 CAD 文件，请先运行 create_cad.py 生成图纸！")
+        return
+
+    rooms = _extract_rooms(msp)
+    doors = _extract_doors(msp)
+    windows = _extract_windows(msp)
+    cabinets = _extract_cabinets(msp)
+    sockets = list(msp.query('INSERT[layer=="E-SOCKET"]'))
+
+    _assign_entities(rooms, doors, "doors")
+    _assign_entities(rooms, windows, "windows")
+    _assign_entities(rooms, cabinets, "cabinets")
+
+    for room in rooms:
+        room["socket_count"] = sum(
+            1 for s in sockets
+            if room["polygon"].contains(Point(s.dxf.insert.x, s.dxf.insert.y))
+        )
+
+    print(f"📐 图纸解析完成: {dxf_path}")
+    print(f"   共识别 {len(rooms)} 个房间区域\n")
+
+    total_area = 0.0
+    for room in sorted(rooms, key=lambda r: r["name"]):
+        _print_room_report(room)
+        total_area += _mm2m2(room["polygon"].area)
+
+    print("====== 汇总 ======")
+    print(f"房间总数:\t{len(rooms)}")
+    print(f"地面总面积:\t{total_area:.2f} m²")
+    print(f"门总数:\t\t{len(doors)} 樘")
+    print(f"窗总数:\t\t{len(windows)} 扇")
+    print(f"橱柜组数:\t{len(cabinets)} 组")
+
+
+if __name__ == "__main__":
+    parse_and_calculate()
