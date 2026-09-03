@@ -1,81 +1,77 @@
 import ezdxf
 from shapely.geometry import Polygon, Point
-import math
 
-INCH_TO_METER = 0.0254
-SQ_INCH_TO_SQ_FT = 1 / 144.0
-SQ_FT_TO_SQ_M = 0.092903
-CEILING_HEIGHT_INCHES = 96  # 8 英尺层高
-PAINT_COVERAGE_SQFT_PER_GAL = 350
+FLOOR_LAYERS = ("A-FLOOR", "A-FLOOR-SHOWER", "A-FLOOR-BATH-DRY")
 
-# 默认窗户规格配置 (单位: 英寸)
-DEFAULT_WIN_WIDTH = 36   # 3 英尺宽
-DEFAULT_WIN_HEIGHT = 60  # 5 英尺高
-WIN_MOLDING_WASTE_RATE = 1.10 # 10% 窗套线切割损耗
 
-def parse_and_calculate():
+def _polyline_to_polygon(poly):
+    points = [(p[0], p[1]) for p in poly.get_points()]
+    return Polygon(points)
+
+
+def _mm2m(value_mm):
+    return value_mm / 1000
+
+
+def _mm2m2(area_mm2):
+    return area_mm2 / 1_000_000
+
+
+def _rect_from_polygon(polygon):
+    minx, miny, maxx, maxy = polygon.bounds
+    return maxx - minx, maxy - miny
+
+
+def _resolve_room_name(polygon, texts):
+    for text in texts:
+        label = text.dxf.text.strip()
+        if "户型平面图" in label or label in ("吊柜", "地柜"):
+            continue
+        pos = Point(text.dxf.insert.x, text.dxf.insert.y)
+        if polygon.contains(pos):
+            return label
+    return "未命名区域"
+
+
+def _extract_rooms(msp):
+    texts = list(msp.query('TEXT[layer=="A-ROOM-NAME"]'))
+    rooms = []
+    for layer in FLOOR_LAYERS:
+        for poly in msp.query(f'LWPOLYLINE[layer=="{layer}"]'):
+            if not poly.closed:
+                continue
+            polygon = _polyline_to_polygon(poly)
+            rooms.append({
+                "name": _resolve_room_name(polygon, texts),
+                "layer": layer,
+                "polygon": polygon,
+            })
+    return rooms
+
+
+def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
     try:
-        doc = ezdxf.readfile("westwood_proposed_plan.dxf")
+        doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
     except IOError:
-        print("❌ 找不到 DXF 文件，请先运行生成脚本！")
+        print("❌ 找不到 CAD 文件，请先运行 create_cad.py 生成图纸！")
         return
 
-    layer_mapping = {
-        'A-FLOOR-GARAGE': '车库耐磨环氧地面',
-        'A-FLOOR-LIVING': '实木地板 / 瓷砖'
-    }
-    
-    room_labels = [t for t in msp.query('TEXT[layer=="A-ROOM-NAME"]')]
-    windows = [w for w in msp.query('INSERT[layer=="A-WINDOW"]')]
+    rooms = _extract_rooms(msp)
 
-    print("================ 综合工程量与采购清单 (含窗套线) ================\n")
+    print(f"📐 图纸解析完成: {dxf_path}")
+    print(f"   共识别 {len(rooms)} 个房间区域\n")
 
-    total_window_molding_ft = 0.0
+    for room in sorted(rooms, key=lambda r: r["name"]):
+        polygon = room["polygon"]
+        width_mm, depth_mm = _rect_from_polygon(polygon)
+        print(f"====== {room['name']} ======")
+        print(f"图层:\t\t{room['layer']}")
+        print(f"净面积:\t\t{_mm2m2(polygon.area):.2f} m²")
+        print(f"周长:\t\t{_mm2m(polygon.length):.2f} m")
+        print(f"包络尺寸:\t{_mm2m(width_mm):.2f} m × {_mm2m(depth_mm):.2f} m (宽×深)")
+        print()
 
-    for layer, material_name in layer_mapping.items():
-        polys = [p for p in msp.query(f'LWPOLYLINE[layer=="{layer}"]') if p.closed]
-        
-        for poly in polys:
-            points = [(p[0], p[1]) for p in poly.get_points()]
-            shape = Polygon(points)
-            
-            # 使用 12 英寸缓冲区覆盖外墙上的窗户中心点
-            buffered_shape = shape.buffer(12.0)
-
-            # 匹配房间名称
-            room_name = "未命名区域"
-            for t in room_labels:
-                if shape.contains(Point(t.dxf.insert.x, t.dxf.insert.y)):
-                    room_name = t.dxf.text
-                    break
-
-            # 1. 基础尺寸
-            area_sqft = shape.area * SQ_INCH_TO_SQ_FT
-            perimeter_ft = shape.length / 12.0
-
-            # 2. 踢脚线 (8% 损耗)
-            baseboard_ft = math.ceil(perimeter_ft * 1.08)
-
-            # 3. 窗户与窗套线算法 (Window Molding)
-            room_windows = [w for w in windows if buffered_shape.contains(Point(w.dxf.insert.x, w.dxf.insert.y))]
-            win_count = len(room_windows)
-            
-            # 单窗周长 (英寸) -> 换算为英尺
-            single_win_molding_ft = (2 * (DEFAULT_WIN_WIDTH + DEFAULT_WIN_HEIGHT)) / 12.0
-            room_win_molding_ft = win_count * single_win_molding_ft * WIN_MOLDING_WASTE_RATE
-            total_window_molding_ft += room_win_molding_ft
-
-            # 输出明细
-            print(f"📍【{room_name}】")
-            print(f"  ├─ 地面净面积:     {area_sqft:.1f} sq ft")
-            print(f"  ├─ 踢脚线需用量:   {baseboard_ft} ft")
-            print(f"  ├─ 窗户数量:       {win_count} 扇")
-            print(f"  └─ 窗套线采购需求: {math.ceil(room_win_molding_ft)} ft (含10%损耗)\n")
-
-    print("-------------------- 采购总量汇总 --------------------")
-    print(f" Total 全屋窗套线条总需求: {math.ceil(total_window_molding_ft)} ft")
-    print("==========================================================")
 
 if __name__ == "__main__":
     parse_and_calculate()
