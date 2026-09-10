@@ -47,6 +47,8 @@ def _extract_rooms(msp):
                 "polygon": polygon,
                 "doors": [],
                 "windows": [],
+                "cabinets": [],
+                "socket_count": 0,
             })
     return rooms
 
@@ -128,6 +130,25 @@ def _extract_windows(msp):
     return windows
 
 
+def _extract_cabinets(msp):
+    """提取橱柜矩形：闭合多段线的宽、深、面积"""
+    cabinets = []
+    for layer, cab_type in (("A-CABINET-BASE", "地柜"), ("A-CABINET-WALL", "吊柜")):
+        for poly in msp.query(f'LWPOLYLINE[layer=="{layer}"]'):
+            if not poly.closed:
+                continue
+            polygon = _polyline_to_polygon(poly)
+            width_mm, depth_mm = _rect_from_polygon(polygon)
+            cabinets.append({
+                "type": cab_type,
+                "width_mm": width_mm,
+                "depth_mm": depth_mm,
+                "area_m2": _mm2m2(polygon.area),
+                "position": (polygon.centroid.x, polygon.centroid.y),
+            })
+    return cabinets
+
+
 def _assign_entities(rooms, entities, attr):
     for entity in entities:
         pt = Point(entity["position"])
@@ -148,9 +169,18 @@ def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
     rooms = _extract_rooms(msp)
     doors = _extract_doors(msp)
     windows = _extract_windows(msp)
+    cabinets = _extract_cabinets(msp)
+    sockets = list(msp.query('INSERT[layer=="E-SOCKET"]'))
 
     _assign_entities(rooms, doors, "doors")
     _assign_entities(rooms, windows, "windows")
+    _assign_entities(rooms, cabinets, "cabinets")
+
+    for room in rooms:
+        room["socket_count"] = sum(
+            1 for s in sockets
+            if room["polygon"].contains(Point(s.dxf.insert.x, s.dxf.insert.y))
+        )
 
     print(f"📐 图纸解析完成: {dxf_path}")
     print(f"   共识别 {len(rooms)} 个房间区域\n")
@@ -173,6 +203,18 @@ def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
             print(f"窗 ({len(room['windows'])} 扇):")
             for i, win in enumerate(room["windows"], 1):
                 print(f"  [{i}] 洞口宽度 {_mm2m(win['width_mm']):.2f} m")
+
+        if room["cabinets"]:
+            print(f"橱柜 ({len(room['cabinets'])} 组):")
+            for i, cab in enumerate(room["cabinets"], 1):
+                print(
+                    f"  [{i}] {cab['type']}  "
+                    f"{_mm2m(cab['width_mm']):.2f} m × {_mm2m(cab['depth_mm']):.2f} m  "
+                    f"面积 {cab['area_m2']:.2f} m²"
+                )
+
+        if room["socket_count"]:
+            print(f"插座:\t\t{room['socket_count']} 个")
 
         print()
 
