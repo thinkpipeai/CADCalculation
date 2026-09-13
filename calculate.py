@@ -3,7 +3,6 @@ from shapely.geometry import Polygon, Point, LineString
 
 FLOOR_LAYERS = ("A-FLOOR", "A-FLOOR-SHOWER", "A-FLOOR-BATH-DRY")
 
-
 def _polyline_to_polygon(poly):
     points = [(p[0], p[1]) for p in poly.get_points()]
     return Polygon(points)
@@ -23,6 +22,8 @@ def _rect_from_polygon(polygon):
 
 
 def _resolve_room_name(polygon, texts):
+    centroid = polygon.centroid
+    nearest = None
     for text in texts:
         label = text.dxf.text.strip()
         if "户型平面图" in label or label in ("吊柜", "地柜"):
@@ -30,6 +31,11 @@ def _resolve_room_name(polygon, texts):
         pos = Point(text.dxf.insert.x, text.dxf.insert.y)
         if polygon.contains(pos):
             return label
+        dist = pos.distance(centroid)
+        if nearest is None or dist < nearest[0]:
+            nearest = (dist, label)
+    if nearest and nearest[0] < 2000:
+        return nearest[1]
     return "未命名区域"
 
 
@@ -156,6 +162,50 @@ def _assign_entities(rooms, entities, attr):
             if room["polygon"].contains(pt):
                 room[attr].append(entity)
                 break
+        else:
+            candidates = [
+                r for r in rooms
+                if r["polygon"].boundary.distance(pt) < 500
+            ]
+            if candidates:
+                max(candidates, key=lambda r: r["polygon"].area)[attr].append(entity)
+
+
+def _print_room_report(room):
+    polygon = room["polygon"]
+    area_m2 = _mm2m2(polygon.area)
+    perimeter_m = _mm2m(polygon.length)
+    width_mm, depth_mm = _rect_from_polygon(polygon)
+
+    print(f"====== {room['name']} ======")
+    print(f"图层:\t\t{room['layer']}")
+    print(f"净面积:\t\t{area_m2:.2f} m²")
+    print(f"周长:\t\t{perimeter_m:.2f} m")
+    print(f"包络尺寸:\t{_mm2m(width_mm):.2f} m × {_mm2m(depth_mm):.2f} m (宽×深)")
+
+    if room["doors"]:
+        print(f"门 ({len(room['doors'])} 樘):")
+        for i, door in enumerate(room["doors"], 1):
+            print(f"  [{i}] {door['type']}  宽度 {_mm2m(door['width_mm']):.2f} m")
+
+    if room["windows"]:
+        print(f"窗 ({len(room['windows'])} 扇):")
+        for i, win in enumerate(room["windows"], 1):
+            print(f"  [{i}] 洞口宽度 {_mm2m(win['width_mm']):.2f} m")
+
+    if room["cabinets"]:
+        print(f"橱柜 ({len(room['cabinets'])} 组):")
+        for i, cab in enumerate(room["cabinets"], 1):
+            print(
+                f"  [{i}] {cab['type']}  "
+                f"{_mm2m(cab['width_mm']):.2f} m × {_mm2m(cab['depth_mm']):.2f} m  "
+                f"面积 {cab['area_m2']:.2f} m²"
+            )
+
+    if room["socket_count"]:
+        print(f"插座:\t\t{room['socket_count']} 个")
+
+    print()
 
 
 def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
@@ -185,38 +235,17 @@ def parse_and_calculate(dxf_path="test_floor_plan.dxf"):
     print(f"📐 图纸解析完成: {dxf_path}")
     print(f"   共识别 {len(rooms)} 个房间区域\n")
 
+    total_area = 0.0
     for room in sorted(rooms, key=lambda r: r["name"]):
-        polygon = room["polygon"]
-        width_mm, depth_mm = _rect_from_polygon(polygon)
-        print(f"====== {room['name']} ======")
-        print(f"图层:\t\t{room['layer']}")
-        print(f"净面积:\t\t{_mm2m2(polygon.area):.2f} m²")
-        print(f"周长:\t\t{_mm2m(polygon.length):.2f} m")
-        print(f"包络尺寸:\t{_mm2m(width_mm):.2f} m × {_mm2m(depth_mm):.2f} m (宽×深)")
+        _print_room_report(room)
+        total_area += _mm2m2(room["polygon"].area)
 
-        if room["doors"]:
-            print(f"门 ({len(room['doors'])} 樘):")
-            for i, door in enumerate(room["doors"], 1):
-                print(f"  [{i}] {door['type']}  宽度 {_mm2m(door['width_mm']):.2f} m")
-
-        if room["windows"]:
-            print(f"窗 ({len(room['windows'])} 扇):")
-            for i, win in enumerate(room["windows"], 1):
-                print(f"  [{i}] 洞口宽度 {_mm2m(win['width_mm']):.2f} m")
-
-        if room["cabinets"]:
-            print(f"橱柜 ({len(room['cabinets'])} 组):")
-            for i, cab in enumerate(room["cabinets"], 1):
-                print(
-                    f"  [{i}] {cab['type']}  "
-                    f"{_mm2m(cab['width_mm']):.2f} m × {_mm2m(cab['depth_mm']):.2f} m  "
-                    f"面积 {cab['area_m2']:.2f} m²"
-                )
-
-        if room["socket_count"]:
-            print(f"插座:\t\t{room['socket_count']} 个")
-
-        print()
+    print("====== 汇总 ======")
+    print(f"房间总数:\t{len(rooms)}")
+    print(f"地面总面积:\t{total_area:.2f} m²")
+    print(f"门总数:\t\t{len(doors)} 樘")
+    print(f"窗总数:\t\t{len(windows)} 扇")
+    print(f"橱柜组数:\t{len(cabinets)} 组")
 
 
 if __name__ == "__main__":
